@@ -34,6 +34,8 @@ impl Context {
             opaque_stroke_cmds: Vec::new(),
             z_index: 0,
             id: VectorImageId(id),
+            shared_data_layout: MemoryLayout::new(GpuAddressType::Shared),
+            instance_data_layout: MemoryLayout::new(GpuAddressType::Instance),
         }
     }    
 
@@ -89,36 +91,87 @@ pub struct EffectId(u32);
 pub struct GeometryId(u32);
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct GpuAddress(i32);
+pub struct GpuAddress(u32);
+
+const GPU_ADDR_HEADER_MASK: u32 = 0b11111111_00000000_00000000_00000000;
+const GPU_ADDR_OFFSET_MASK: u32 = !GPU_ADDR_HEADER_MASK;
+const GPU_ADDR_GLOBAL: u32      = 0b00000000_00000000_00000000_00000000;
+const GPU_ADDR_INSTANCE: u32    = 0b10000000_00000000_00000000_00000000;
+const GPU_ADDR_SHARED: u32      = 0b01000000_00000000_00000000_00000000;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum GpuAddressType {
+    Global,
+    Instance,
+    Shared,
+}
+
+impl GpuAddress {
+    pub fn new(ty: GpuAddressType, offset: u32) -> Self {
+        assert!(offset & GPU_ADDR_HEADER_MASK == 0);
+        let header = match ty {
+            GpuAddressType::Global => GPU_ADDR_GLOBAL,
+            GpuAddressType::Instance => GPU_ADDR_INSTANCE,
+            GpuAddressType::Shared => GPU_ADDR_SHARED,
+        };
+        GpuAddress(offset | header)
+    }
+
+    pub fn global(offset: u32) -> Self {
+        assert!(offset & GPU_ADDR_HEADER_MASK == 0);
+        GpuAddress(offset)
+    }
+
+    pub fn instance(offset: u32) -> Self {
+        assert!(offset & GPU_ADDR_HEADER_MASK == 0);
+        GpuAddress(offset | GPU_ADDR_INSTANCE)
+    }
+
+    pub fn shared(offset: u32) -> Self {
+        assert!(offset & GPU_ADDR_HEADER_MASK == 0);
+        GpuAddress(offset | GPU_ADDR_SHARED)
+    }
+
+    // TODO: it would be better to use an offset plus the id of
+    // the vector image to prevent from using a local transform
+    // of an image on another image.
+    pub fn address_type(&self) -> GpuAddressType {
+        match self.0 & GPU_ADDR_HEADER_MASK {
+            GPU_ADDR_INSTANCE => GpuAddressType::Instance,
+            GPU_ADDR_SHARED => GpuAddressType::Shared,
+            GPU_ADDR_GLOBAL => GpuAddressType::Global,
+            _ => { panic!("Invalid gpu address type header"); }
+        }
+    }
+
+    pub fn offset(&self) -> u32 { self.0 & GPU_ADDR_OFFSET_MASK }
+
+    pub fn add_assign(&mut self, val: u32) {
+        assert!(val & GPU_ADDR_HEADER_MASK == 0);
+        self.0 += val;
+        self.0 &= GPU_ADDR_OFFSET_MASK;
+    }
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct GpuAddressRange {
-    start: i32,
-    end: i32,
+    start: GpuAddress,
+    end: GpuAddress,
 }
 
 impl GpuAddressRange {
-    pub fn start(&self) -> GpuAddress { GpuAddress(self.start) }
+    pub fn start(&self) -> GpuAddress { self.start }
 
     pub fn is_empty(&self) -> bool { self.start == self.end }
 
     pub fn shrink_left(&mut self, amount: u32) {
-        assert!(self.end.abs() - self.start.abs() >= amount as i32);
-        let sign = self.start.signum()  ;
-        self.start = sign * (self.start.abs() + amount as i32);
+        assert!(self.end.offset() - self.start.offset() >= amount);
+        self.start.add_assign(amount);
     }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct VectorImageId(u32);
-
-impl GpuAddress {
-    // TODO: it would be better to use an offset plus the id of
-    // the vector image to prevent from using a local transform
-    // of an image on another image.
-    pub fn is_local(&self) -> bool { self.0 >= 0 }
-    pub fn is_global(&self) -> bool { self.0 < 0 }
-}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct FillId(GpuAddress);
@@ -172,6 +225,8 @@ pub struct VectorImageBuilder {
     gpu_data: GpuMemory,
     z_index: u32,
     id: VectorImageId,
+    shared_data_layout: MemoryLayout,
+    instance_data_layout: MemoryLayout,
 }
 
 impl VectorImageBuilder {
@@ -243,6 +298,8 @@ impl VectorImageBuilder {
         return address;
     }
 
+    pub fn shared_data_mut(&self) -> &mut MemoryLayout { &mut self.shared_data_layout }
+
     pub fn build(mut self, geom: &mut GeometryBuilder) -> VectorImageInstance {
         let mut fill_tess = tess::FillTessellator::new();
         let mut stroke_tess = tess::StrokeTessellator::new();
@@ -271,7 +328,7 @@ impl VectorImageBuilder {
         let contains_stroke_ops = cmds.len() > 0;
         for cmd in cmds.into_iter().rev() {
             match cmd.shape {
-                Shape::Path { path, tolerance } => {
+                Shape::Path { path, .. } => {
                     stroke_tess.tessellate_path(
                         path.path_iter(),
                         &cmd.options,
@@ -296,6 +353,8 @@ impl VectorImageBuilder {
                     mem_per_instance: self.gpu_data.len() as u32,
                     contains_fill_ops,
                     contains_stroke_ops,
+                    shared_data_layout: self.shared_data_layout,
+                    instance_data_layout: self.instance_data_layout,
                 }
             }),
             gpu_data: self.gpu_data,
@@ -336,7 +395,7 @@ pub struct VectorImage {
     // TODO: keep track of which portion of the buffer the image uses.
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 struct VectorImageDescriptor {
     geometry: GeometryId,
     id: VectorImageId,
@@ -344,6 +403,8 @@ struct VectorImageDescriptor {
     mem_per_instance: u32,
     contains_fill_ops: bool,
     contains_stroke_ops: bool,
+    shared_data_layout: MemoryLayout,
+    instance_data_layout: MemoryLayout,
 }
 
 impl VectorImage {
@@ -399,7 +460,7 @@ impl tess::VertexConstructor<tess::StrokeVertex, GpuStrokeVertex> for VertexCtor
             position: vertex.position.to_array(),
             normal: vertex.normal.to_array(),
             advancement: vertex.advancement,
-            prim_id: (self.0).0,
+            prim_id: (self.0).0 as i32,
         }
     }
 }
@@ -417,7 +478,7 @@ impl GpuMemory {
 
     fn push<Block: GpuBlock>(&mut self, block: &Block) -> GpuAddress {
         debug_assert_eq!(block.slice().len() % 4, 0);
-        let address = GpuAddress(self.buffer.len() as i32);
+        let address = GpuAddress::global(self.buffer.len() as u32);
         self.buffer.extend(block.slice().iter().cloned());
         return address;
     }
@@ -456,7 +517,8 @@ pub struct LayerBuilder {
 
 impl LayerBuilder {
     pub fn add(&mut self, instance: Rc<VectorImageInstance>) {
-        let img = instance.base().descriptor;
+        let img = instance.base().descriptor.clone();
+        let z_range = img.z_range;
         self.vector_images.entry(img.id).or_insert(
             LayerVectorImage {
                 instances: Vec::new(),
@@ -468,7 +530,7 @@ impl LayerBuilder {
             z_index: self.z_index,
         });
 
-        self.z_index += img.z_range;
+        self.z_index += z_range;
     }
 
     pub fn build(mut self, ctx: &mut Context) -> Layer {
@@ -577,6 +639,84 @@ pub enum VertexType {
     Stroke,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ScalarType {
+    I32,
+    F32,
+    Address,
+    Unknown,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DataType {
+    pub scalar: ScalarType,
+    pub size: u32,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Member {
+    pub ty: DataType,
+    pub offset: GpuAddress,
+}
+
+impl DataType {
+    pub fn size(&self) -> u32 { self.size }
+
+    pub fn alignment(&self) -> u32 {
+        // TODO: maybe it would be simpler to just align everything on 4 words.
+        match self.size() {
+            1 => { 1 }
+            2 => { 2 }
+            3 => { 4 }
+            n => { (n / 4) * 4 }
+        }
+    }
+
+    pub fn float() -> Self { DataType { scalar: ScalarType::F32, size: 1 } }
+    pub fn vec2() -> Self { DataType { scalar: ScalarType::F32, size: 2 } }
+    pub fn vec3() -> Self { DataType { scalar: ScalarType::F32, size: 3 } }
+    pub fn vec4() -> Self { DataType { scalar: ScalarType::F32, size: 4 } }
+
+    pub fn transform_2d() -> Self { DataType { scalar: ScalarType::F32, size: 6 } }
+    pub fn transform_3d() -> Self { DataType { scalar: ScalarType::F32, size: 16 } }
+
+    pub fn int() -> Self { DataType { scalar: ScalarType::I32, size: 1 } }
+    pub fn ivec2() -> Self { DataType { scalar: ScalarType::I32, size: 2 } }
+    pub fn ivec3() -> Self { DataType { scalar: ScalarType::I32, size: 3 } }
+    pub fn ivec4() -> Self { DataType { scalar: ScalarType::I32, size: 4 } }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryLayout {
+    members: Vec<Member>,
+    size: u32,
+    mem_type: GpuAddressType,
+}
+
+impl MemoryLayout {
+    pub fn new(mem_type: GpuAddressType) -> Self {
+        MemoryLayout {
+            members: Vec::new(),
+            size: 0,
+            mem_type,
+        }
+    }
+
+    pub fn alloc(&mut self, ty: DataType) -> GpuAddress {
+        let alignment = ty.alignment();
+        let adjust = match self.size % alignment {
+            0 => 0,
+            n => { alignment - n }
+        };
+        let addr = GpuAddress::new(self.mem_type, self.size + adjust);
+        self.members.push(Member { ty, offset: addr });
+
+        self.size += adjust + ty.size();
+
+        return addr;
+    }
+}
+
 pub trait Device {
     fn allocate_gpu_data(&mut self, _size: u32) -> GpuAddressRange;
     fn set_gpu_data(&mut self, _range: GpuAddressRange, _data: &GpuMemory);
@@ -590,26 +730,26 @@ use gfx_renderer::{GlDevice, GlFactory, GpuGeometry, GlDataTexture};
 //use gfx::traits::Device as GfxDevice;
 
 pub struct GfxDevice {
-    device: GlDevice,
+    _device: GlDevice,
     factory: GlFactory,
 
     alloc: u32,
 
     fill_geom: HashMap<GeometryId, GpuGeometry<GpuFillVertex>>,
     stroke_geom: HashMap<GeometryId, GpuGeometry<GpuStrokeVertex>>,
-    data_texture: GlDataTexture,
+    _data_texture: GlDataTexture,
 }
 
 impl Device for GfxDevice {
     fn allocate_gpu_data(&mut self, size: u32) -> GpuAddressRange {
-        let start = self.alloc as i32;
+        let start = GpuAddress::global(self.alloc);
         self.alloc += size;
-        let end = self.alloc as i32;
+        let end = GpuAddress::global(self.alloc);
         GpuAddressRange { start, end }
     }
 
     fn set_gpu_data(&mut self, range: GpuAddressRange, _data: &GpuMemory) {
-        assert!(self.alloc >= range.end as u32);
+        assert!(self.alloc >= range.end.offset());
     }
 
     fn submit_geometry(&mut self, geom: GeometryBuilder) {
@@ -644,13 +784,13 @@ fn simple_vector_image() {
     struct DummyDevice(u32);
     impl Device for DummyDevice {
         fn allocate_gpu_data(&mut self, size: u32) -> GpuAddressRange {
-            let start = self.0 as i32;
+            let start = self.0;
             self.0 += size;
-            let end = self.0 as i32;
-            GpuAddressRange { start, end }
+            let end = self.0;
+            GpuAddressRange { start: GpuAddress::global(start), end: GpuAddress::global(end) }
         }
         fn set_gpu_data(&mut self, range: GpuAddressRange, _data: &GpuMemory) {
-            assert!(self.0 >= range.end as u32);
+            assert!(self.0 >= range.end.offset());
         }
         fn submit_geometry(&mut self, _geom: GeometryBuilder) {}
         fn render_pass(&mut self, _cmds: &[DrawCmd], _options: &RenderPassOptions) {}
@@ -688,7 +828,7 @@ fn simple_vector_image() {
     let img0 = Rc::new(builder.build(&mut geom));
     let img1 = Rc::new(img0.clone_instance());
 
-    let prim_id = GpuAddress(geom.fill.vertices[0].prim_id);
+    let prim_id = GpuAddress::global(geom.fill.vertices[0].prim_id as u32);
 
     let mut layer = ctx.new_layer();
     layer.add(Rc::clone(&img0));
